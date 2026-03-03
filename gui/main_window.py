@@ -10,6 +10,7 @@ import tempfile
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidTag
 
 from crypto import crypto_operations, key_management
 from database import db_queries
@@ -260,28 +261,49 @@ class MainWindow:
             return
         item = self.restore_tree.item(selected[0])
         request_id = item['values'][0]
-        
+
+        # Fetch request details
         conn = db_queries.get_db_connection()
         if not conn:
             return
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT rr.status, b.* FROM restore_requests rr
+            SELECT rr.status, rr.approver_id, rr.approver_signature, b.*
+            FROM restore_requests rr
             JOIN backups b ON rr.backup_id = b.backup_id
             WHERE rr.request_id = %s
         """, (request_id,))
         result = cursor.fetchone()
         cursor.close()
         conn.close()
-        
+
         if not result:
             messagebox.showerror("Error", "Request not found")
             return
-        
+
         if result['status'] != 'approved':
             messagebox.showerror("Error", "This request is not yet approved")
             return
-        
+
+        # --- New: Verify approval signature ---
+        if result['approver_id'] and result['approver_signature']:
+            approver = db_queries.get_user_by_id(result['approver_id'])
+            if not approver:
+                messagebox.showerror("Error", "Approver not found")
+                return
+            try:
+                approver_pub_key = serialization.load_pem_public_key(approver['public_key'].encode(), default_backend())
+                if not crypto_operations.verify_approval_signature(approver_pub_key, request_id, result['approver_signature']):
+                    messagebox.showerror("Error", "Approval signature is invalid – possible tampering")
+                    return
+            except Exception as e:
+                messagebox.showerror("Error", f"Signature verification failed: {e}")
+                return
+        else:
+            messagebox.showerror("Error", "Missing approver information")
+            return
+        # --- End of new code ---
+
         save_dir = filedialog.askdirectory(title="Select directory to extract files")
         if not save_dir:
             return
@@ -307,8 +329,15 @@ class MainWindow:
             messagebox.showinfo("Success", f"Files extracted to {save_dir}")
             self.restore_status.config(text="Restore successful", fg="green")
             db_queries.insert_audit_log(self.user['user_id'], "RESTORE_DOWNLOAD", f"Request ID {request_id}")
+        
+        except InvalidTag as e:
+            messagebox.showerror("Integrity Error", 
+                "Backup integrity check failed. The data may have been tampered with.")
+            self.restore_status.config(text="Restore failed – integrity violation", fg="red")
+        
         except Exception as e:
-            messagebox.showerror("Error", f"Restore failed: {e}")
+            messagebox.showerror("Error", f"Restore failed: {str(e)}")
+            self.restore_status.config(text="Restore failed", fg="red")
     
     def setup_approve_tab(self):
         tk.Label(self.approve_frame, text="Pending Restore Approvals", font=("Arial", 14)).pack(pady=10)
@@ -524,7 +553,6 @@ class MainWindow:
         except Exception as e:
             messagebox.showerror("Error", f"Verification failed: {e}")
     
-    # ---------- NEW Messaging Tab ----------
     def setup_messages_tab(self):
         tk.Label(self.messages_frame, text="Messages", font=("Arial", 14)).pack(pady=10)
         
@@ -674,7 +702,6 @@ class MainWindow:
         
         tk.Button(dialog, text="Send", command=send).pack(pady=10)
     
-    # ---------- Updated Audit Log Tab with Filter ----------
     def setup_audit_tab(self):
         tk.Label(self.audit_frame, text="System Audit Log", font=("Arial", 14)).pack(pady=10)
         

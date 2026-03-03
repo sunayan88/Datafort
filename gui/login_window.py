@@ -10,7 +10,7 @@ from cryptography import x509
 from crypto import key_management
 from database import db_queries
 from gui.register_window import RegisterWindow
-
+from crypto.bruteforce import check_account_locked, handle_failed_login, handle_successful_login
 
 class LoginWindow:
     def __init__(self):
@@ -89,6 +89,13 @@ class LoginWindow:
             messagebox.showerror("Error", "User not found or inactive")
             return
         
+        # Brute‑force protection: check if account is locked
+        if check_account_locked(user['user_id']):
+            self.status_var.set("Ready")
+            messagebox.showerror("Error", "Account temporarily locked due to too many failed attempts. Try again later.")
+            return
+        
+        # Revocation check
         try:
             cert_der = user['certificate']
             if cert_der:
@@ -109,6 +116,8 @@ class LoginWindow:
         try:
             private_key = key_management.load_encrypted_private_key(str(key_path), passphrase)
         except Exception:
+            # Failed login (passphrase)
+            handle_failed_login(username)
             self.status_var.set("Ready")
             messagebox.showerror("Error", "Invalid passphrase or corrupted key")
             return
@@ -137,6 +146,9 @@ class LoginWindow:
                 hashes.SHA256()
             )
             
+            # Successful login
+            handle_successful_login(username)
+            
             db_queries.insert_audit_log(user['user_id'], "LOGIN", f"User {username} logged in")
             
             self.status_var.set("Login successful")
@@ -160,6 +172,8 @@ class LoginWindow:
             self.status_var.set("Ready")
             
         except Exception as e:
+            # Failed login (signature verification)
+            handle_failed_login(username)
             self.status_var.set("Ready")
             messagebox.showerror("Error", "Authentication failed")
     
