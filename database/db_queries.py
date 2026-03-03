@@ -11,7 +11,12 @@ def get_user_by_username(username):
     if not conn:
         return None
     cursor = conn.cursor(dictionary=True)
-    query = "SELECT user_id, username, role, public_key, certificate FROM users WHERE username = %s AND is_active = TRUE"
+    query = """
+        SELECT user_id, username, role, public_key, certificate,
+               failed_login_attempts, locked_until
+        FROM users
+        WHERE username = %s AND is_active = TRUE
+    """
     cursor.execute(query, (username,))
     user = cursor.fetchone()
     cursor.close()
@@ -515,3 +520,44 @@ def get_admin_user_id():
     cursor.close()
     conn.close()
     return result[0] if result else None
+
+def get_user_by_id(user_id):
+    conn = get_db_connection()
+    if not conn:
+        return None
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT user_id, username, role, public_key, certificate, failed_login_attempts, locked_until FROM users WHERE user_id = %s", (user_id,))
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return user
+
+def increment_failed_attempts(user_id):
+    conn = get_db_connection()
+    if not conn:
+        return
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE user_id = %s", (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def reset_failed_attempts(user_id):
+    conn = get_db_connection()
+    if not conn:
+        return
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE user_id = %s", (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def lock_user_account(user_id, lock_until):
+    conn = get_db_connection()
+    if not conn:
+        return
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET failed_login_attempts = 0, locked_until = %s WHERE user_id = %s", (lock_until, user_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
