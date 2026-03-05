@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: datafort-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: datafort_db
+      MYSQL_USER: datafort_user
+      MYSQL_PASSWORD: datafort_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d
+    networks:
+      - datafort-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 10s
+      retries: 5
+
+  datafort:
+    build: .
+    container_name: datafort-app
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      - DISPLAY=${DISPLAY:-host.docker.internal:0}   # Windows default
+      - DB_HOST=mysql
+      - DB_USER=datafort_user
+      - DB_PASSWORD=datafort_pass
+      - DB_NAME=datafort_db
+      - DB_PORT=3306
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw      # For Linux (ignored on Windows)
+      - datafort-keys:/root/.datafort
+    networks:
+      - datafort-network
+    stdin_open: true
+    tty: true
+
+networks:
+  datafort-network:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  datafort-keys:
