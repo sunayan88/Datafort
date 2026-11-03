@@ -1,1 +1,405 @@
+# DATAFORT
 
+**Enterprise-grade encrypted backup and controlled-recovery tool for sensitive organizational data.**
+
+DATAFORT is a Python desktop application (Tkinter GUI, MySQL backend) that lets an organization back up files in encrypted form and restore them only after a manager or admin approves the request. Identity is handled with a small built-in PKI: every user holds an RSA key pair and a certificate issued by the application's own Root CA.
+
+---
+
+## Table of Contents
+
+1. [Features](#features)
+2. [Architecture Overview](#architecture-overview)
+3. [Project Structure](#project-structure)
+4. [Roles and Permissions](#roles-and-permissions)
+5. [Security Design](#security-design)
+6. [Database Schema](#database-schema)
+7. [Requirements](#requirements)
+8. [Installation: Docker (recommended)](#installation-docker-recommended)
+9. [Installation: Local (without Docker)](#installation-local-without-docker)
+10. [First-Time Setup](#first-time-setup)
+11. [Usage Guide](#usage-guide)
+12. [Configuration](#configuration)
+13. [Known Issues and Limitations](#known-issues-and-limitations)
+14. [Roadmap / Suggested Improvements](#roadmap--suggested-improvements)
+15. [Troubleshooting](#troubleshooting)
+16. [Disclaimer](#disclaimer)
+
+---
+
+## Features
+
+- **Certificate-based authentication.** Login is a challenge-response: the app unlocks the user's local private key with a passphrase, signs a random 32-byte challenge, and verifies it against the public key stored in the database.
+- **Built-in Certificate Authority.** Self-signed Root CA (10-year validity). User certificates are valid for 1 year and are issued by an admin after reviewing a registration request (CSR).
+- **Encrypted backups.** Files are bundled into a tar archive and encrypted with AES-256-GCM. The one-time AES key is wrapped with the system RSA public key (OAEP, SHA-256).
+- **Signed backups.** The uploader signs a manifest hash (encrypted data + file name + reason) with their private key (RSA-PSS, SHA-256).
+- **Approval-gated restore.** A user requests a restore; a manager or admin approves it with a digital signature before the data can be decrypted and extracted.
+- **Document signing and verification.** Sign any file and verify a detached `.sig` signature against a registered user's public key.
+- **Tamper-evident audit log.** Every significant action is recorded and individually signed with the system key; auditors can verify entries from the GUI.
+- **Brute-force protection.** 5 failed logins lock the account for 15 minutes.
+- **Certificate revocation.** Admins can revoke a certificate, which also deactivates the user.
+- **Internal messaging.** Users can message the admin, and admins can message anyone.
+- **Docker support.** `docker-compose` brings up MySQL 8 and the application together.
+
+---
+
+## Architecture Overview
+
+```
++---------------------+        +-----------------------+        +-----------------+
+|  Tkinter GUI        |  --->  |  crypto/ (RSA, AES,   |        |  MySQL 8        |
+|  gui/*.py           |        |  CA, key management)  |        |  datafort_db    |
+|                     |  --->  |  database/db_queries  |  --->  |                 |
++---------------------+        +-----------------------+        +-----------------+
+          |
+          v
+   ~/.datafort/   (local key material: user keys, CA key/cert, system keys)
+```
+
+- The GUI talks directly to the crypto helpers and the query layer.
+- Encrypted backups, certificates, requests, messages and audit entries are stored in MySQL.
+- Private keys never go to the database; they live in `~/.datafort/` on the machine running the app.
+
+---
+
+## Project Structure
+
+```
+Datafort/
+├── main.py                      # Entry point, starts the login window
+├── requirements.txt             # Python dependencies
+├── Dockerfile                   # App image (Python 3.10-slim + Tk + MySQL client libs)
+├── docker-compose.yml           # MySQL + app services
+├── Docker_Tool_installation.md  # Kali Linux install notes
+├── final_schema.sql             # Current database schema
+├── schema.sql                   # OLDER schema (no lockout columns), kept for history
+├── mysql-init/init.sql          # Schema auto-loaded by the MySQL container
+├── tests.py                     # Manual key-loading check (not a real test suite)
+├── config/
+│   ├── config.ini               # Local DB settings
+│   └── docker_config.ini        # DB settings used inside Docker
+├── crypto/
+│   ├── ca.py                    # Root CA creation, CSR signing
+│   ├── key_management.py        # User/system key generation, storage, CSR creation
+│   ├── crypto_operations.py     # AES-GCM backup encryption, RSA signing/verification
+│   └── bruteforce.py            # Login attempt counting and lockout
+├── database/
+│   ├── db_connection.py         # MySQL connection from config.ini
+│   └── db_queries.py            # All SQL: users, requests, backups, audit, messages
+├── gui/
+│   ├── login_window.py          # Login + registration entry
+│   ├── register_window.py       # Registration form (key + CSR generation)
+│   ├── main_window.py           # Employee / manager / auditor interface
+│   ├── admin_panel.py           # Admin interface
+│   ├── backup_tab.py            # (empty placeholder)
+│   ├── restore_tab.py           # (empty placeholder)
+│   └── signing_tab.py           # (empty placeholder)
+├── scripts/
+│   ├── init_ca_and_admin.py     # One-time: create CA and first admin
+│   └── generate_system_keys.py  # One-time: create system key pair
+└── utils/
+    └── helpers.py               # (empty placeholder)
+```
+
+---
+
+## Roles and Permissions
+
+| Capability                         | Employee | Manager | Auditor | Admin |
+|------------------------------------|:--------:|:-------:|:-------:|:-----:|
+| Create encrypted backups           | Yes      | Yes     | No      | No*   |
+| Request restore of own backups     | Yes      | Yes     | No      | No*   |
+| Approve / reject restore requests  | No       | Yes     | No      | Yes   |
+| Sign and verify documents          | Yes      | Yes     | Yes     | No*   |
+| View and verify the audit log      | No       | No      | Yes     | No*   |
+| Approve / reject registrations     | No       | No      | No      | Yes   |
+| Deactivate users, revoke certs     | No       | No      | No      | Yes   |
+| Send messages                      | Yes      | Yes     | Yes     | Yes   |
+
+\* Admins are routed to the Admin Panel, which contains certificate requests, restore approvals, user management and messages.
+
+Users may request the role of employee, manager or auditor at registration; the admin decides. The admin account is created only through `scripts/init_ca_and_admin.py`.
+
+---
+
+## Security Design
+
+### Cryptographic primitives
+
+| Purpose                      | Algorithm                                              |
+|------------------------------|--------------------------------------------------------|
+| User and system key pairs    | RSA-2048                                               |
+| User private key at rest     | PKCS#8, encrypted with a passphrase (`BestAvailableEncryption`) |
+| Backup data encryption       | AES-256-GCM (random 256-bit key, 96-bit nonce per file) |
+| Backup key wrapping          | RSA-OAEP, MGF1-SHA256, SHA-256                         |
+| Signatures                   | RSA-PSS, MGF1-SHA256, SHA-256                          |
+| Certificates                 | X.509, SHA-256 signature, 1-year user validity         |
+
+### Backup flow
+
+1. User selects files and gives a reason.
+2. Files are packed into a temporary tar archive.
+3. A random AES-256 key and nonce encrypt the archive (GCM produces an authentication tag).
+4. The AES key is encrypted with the system public key.
+5. The user enters their passphrase and signs a manifest hash.
+6. Ciphertext, wrapped key, nonce, tag and signature are stored in the `backups` table; the action is written to the audit log.
+
+### Restore flow
+
+1. The user requests a restore for one of their backups (status: pending).
+2. A manager or admin enters their passphrase to sign an approval.
+3. After approval, the user chooses "Download Restored File".
+4. The app verifies the approver's signature, decrypts the AES key with the system private key, decrypts and authenticates the data (GCM tag), then extracts the tar archive to a chosen folder.
+
+### Audit log
+
+Each entry is signed over `user_id|action|details|timestamp` with the system private key. Auditors can verify any selected entry from the GUI. Logged actions include LOGIN, BACKUP, RESTORE_REQUEST, APPROVE_RESTORE, REJECT_RESTORE, SIGN_DOCUMENT, RESTORE_DOWNLOAD and MESSAGE_SENT.
+
+### Where secrets live
+
+| File (in `~/.datafort/`)    | Contents                         | Protected by passphrase? |
+|-----------------------------|----------------------------------|:------------------------:|
+| `<username>_private.pem`    | User private key                 | Yes                      |
+| `<username>_cert.pem`       | Admin certificate (written by setup script) | n/a           |
+| `ca_private.pem`            | Root CA private key              | **No**                   |
+| `ca_cert.pem`               | Root CA certificate              | n/a                      |
+| `system_private.pem`        | Backup-wrapping private key      | **No**                   |
+| `system_public.pem`         | Backup-wrapping public key       | n/a                      |
+
+> Back these files up securely. **If `system_private.pem` is lost, every existing backup becomes permanently unrecoverable.** If a user's private key is lost, they cannot log in or sign anything.
+
+---
+
+## Database Schema
+
+Database name: `datafort_db`. Tables (see `final_schema.sql`):
+
+| Table                  | Purpose                                                        |
+|------------------------|----------------------------------------------------------------|
+| `users`                | Approved users, role, public key, certificate, lockout state   |
+| `certificate_requests` | Pending / approved / rejected registrations (username, CSR)    |
+| `backups`              | Encrypted data, wrapped key, IV, tag, signature, status        |
+| `restore_requests`     | Restore workflow with approver and approval signature          |
+| `audit_log`            | Signed action history                                          |
+| `revoked_certificates` | Revoked certificate serial numbers                             |
+| `messages`             | User-to-user and user-to-admin messages                        |
+
+Roles are an ENUM: `employee`, `manager`, `admin`, `auditor`.
+
+> Use `final_schema.sql` (identical to `mysql-init/init.sql`). The root `schema.sql` is outdated and lacks `failed_login_attempts` and `locked_until`.
+
+---
+
+## Requirements
+
+- Python 3.10 or newer
+- MySQL 8.0
+- Tkinter (`python3-tk` on Debian/Ubuntu/Kali)
+- A graphical display (X11 or Windows/macOS desktop). The app is a GUI program.
+- Python packages (`requirements.txt`):
+  - `mysql-connector-python==8.0.33`
+  - `cryptography==41.0.7`
+  - `pyotp==2.9.0` (currently unused by the code)
+
+For Docker: Docker and Docker Compose.
+
+---
+
+## Installation: Docker (recommended)
+
+These steps follow `Docker_Tool_installation.md` (written for Kali Linux).
+
+```bash
+# 1. Get the code
+git clone https://github.com/sunayan88/Datafort.git
+cd Datafort
+
+# 2. Allow the container to use your display (Linux/X11)
+export DISPLAY=:0
+xhost +local:docker        # may be needed on some systems
+
+# 3. Build and start MySQL + the app
+docker-compose up --build
+```
+
+MySQL is initialized automatically from `mysql-init/init.sql`. Application keys persist in the `datafort-keys` Docker volume, and database data in `mysql-data`.
+
+On Windows, `DISPLAY` defaults to `host.docker.internal:0`; run an X server such as VcXsrv.
+
+Then continue with [First-Time Setup](#first-time-setup).
+
+---
+
+## Installation: Local (without Docker)
+
+```bash
+# 1. Clone
+git clone https://github.com/sunayan88/Datafort.git
+cd Datafort
+
+# 2. Create a clean virtual environment (do not use the committed venv/)
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# 3. Install Tkinter if missing (Debian/Ubuntu/Kali)
+sudo apt install python3-tk
+
+# 4. Create the database
+mysql -u root -p < final_schema.sql
+
+# 5. Point the app at your database
+#    edit config/config.ini: host, user, password, database
+```
+
+Then continue with [First-Time Setup](#first-time-setup).
+
+---
+
+## First-Time Setup
+
+Run these **once**, before anyone logs in. Order matters: the audit log needs the system keys at the first login.
+
+**Docker:**
+
+```bash
+docker exec -it datafort-app bash
+python scripts/init_ca_and_admin.py     # creates Root CA and the admin account
+python scripts/generate_system_keys.py  # creates the system key pair
+```
+
+**Local:**
+
+```bash
+python scripts/init_ca_and_admin.py
+python scripts/generate_system_keys.py
+python main.py
+```
+
+`init_ca_and_admin.py` asks for an admin username and a passphrase (minimum 8 characters), generates the admin key pair, signs the admin certificate with the new CA, and inserts the admin into the database.
+
+> In a multi-machine deployment, every machine running the client needs access to the system public key (to back up), and whichever machine performs restores needs the system private key. Currently both are read from `~/.datafort/` on the local machine.
+
+---
+
+## Usage Guide
+
+### Register a new user
+1. Start the app (`python main.py`) and click **Register**.
+2. Enter a username, choose a role, and set a passphrase (8+ characters). A key pair is generated and a CSR is submitted.
+3. Wait for the admin to approve the request. Keep the generated key file safe.
+
+### Approve registrations (admin)
+Log in as admin, open **Certificate Requests**, review the request, then **Approve** (issues a certificate) or **Reject**.
+
+### Back up files
+1. Log in, open **Backup**, click **Browse** and select one or more files.
+2. Enter a reason and click **Encrypt and Backup**; provide your passphrase to sign.
+3. The backup appears under "Your Recent Backups".
+
+### Restore files
+1. Open **My Restores** and click **Request Restore**, then choose a backup.
+2. A manager or admin approves under **Pending Approvals** (or the admin's **Restore Approvals** tab).
+3. Select your approved request and click **Download Restored File**, then pick a destination folder.
+
+### Sign and verify documents
+Open **Document Signing**. *Sign* creates `<file>.sig` next to your file. *Verify* needs the document, the `.sig` file, and the signer's username.
+
+### Audit log
+Auditors (and admins who use the standard window) can filter by action and use **Verify Selected** to check an entry's signature.
+
+### Manage users (admin)
+Use **User Management** to deactivate, reactivate, or revoke a user's certificate. Revoking also deactivates the user.
+
+---
+
+## Configuration
+
+`config/config.ini` (local):
+
+```ini
+[database]
+host = localhost
+user = root
+password =
+database = datafort_db
+```
+
+`config/docker_config.ini` is copied over `config.ini` inside the Docker image and targets the `mysql` service.
+
+Tunable constants:
+
+| Setting          | Location                  | Default |
+|------------------|---------------------------|---------|
+| Max login attempts | `crypto/bruteforce.py`  | 5       |
+| Lockout duration   | `crypto/bruteforce.py`  | 15 min  |
+| User cert validity | `crypto/ca.py`          | 365 days |
+| CA cert validity   | `crypto/ca.py`          | 3650 days |
+| Key location       | `crypto/key_management.py`, `crypto/ca.py` | `~/.datafort/` |
+
+> Change the default database passwords in `docker-compose.yml` before any real use.
+
+---
+
+## Known Issues and Limitations
+
+**Bug (blocks core function):**
+- **Restore download always fails.** Approvers sign `approve:<id>:<timestamp>`, but the restore step verifies `approve:<id>`. Signature verification therefore always returns false and approved restores cannot be downloaded. Fix: sign exactly `approve:<id>`, or store the timestamp and verify against it.
+
+**Security limitations:**
+- CA key and system key are stored **unencrypted** on disk.
+- The system private key is used by the client, so anyone with access to that machine's `~/.datafort/` can decrypt all backups.
+- A manager can approve their own restore request (no requester/approver separation check).
+- The backup signature is stored but not verified at restore time.
+- CSR signatures are not validated when the CA issues a certificate, and the role is not embedded in the certificate.
+- Lockout protects only the GUI; the encrypted key file can still be attacked offline.
+- Audit entries are individually signed but not hash-chained, so deletion of entries is not detectable.
+- `tarfile.extractall` is used without an extraction filter.
+- Docker defaults use hardcoded passwords and publish MySQL on port 3306.
+
+**Functional limitations:**
+- Backups are stored as `LONGBLOB` in MySQL and loaded fully into memory; large files may exceed MySQL's `max_allowed_packet`.
+- No incremental or scheduled backups, no retention policy, no backup deletion.
+- Admins cannot create backups or sign documents (they only see the Admin Panel).
+- The Admin Panel does not write audit entries for certificate approval or restore approval.
+- `pyotp` is listed as a dependency but 2FA is not implemented.
+- `tests.py` is a manual script, not an automated test suite.
+
+---
+
+## Roadmap / Suggested Improvements
+
+1. Fix the approval-signature mismatch (see above).
+2. Enforce separation of duties (approver must differ from requester).
+3. Encrypt CA and system private keys; consider an HSM or external KMS.
+4. Verify the backup signature and certificate chain/expiry at login and restore.
+5. Chain audit log entries (include the previous entry's hash).
+6. Split `main_window.py` into the planned tab modules and add a service layer between the GUI and SQL.
+7. Add automated tests (crypto round-trips, DB layer, workflows).
+8. Stream large backups to disk or object storage instead of MySQL blobs.
+9. Remove `venv/` and `__pycache__` from the repository and add a `.gitignore`.
+10. Implement TOTP two-factor authentication (`pyotp` is already a dependency).
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| `Authentication failed` right after correct login | System keys not generated yet; run `scripts/generate_system_keys.py`. |
+| `Private key file not found` | The key is looked up at `~/.datafort/<username>_private.pem` on the current machine. |
+| `Database connection error` | Check `config/config.ini` and that MySQL is running; in Docker wait for the MySQL healthcheck. |
+| GUI does not appear in Docker | Set `DISPLAY`, allow X access (`xhost +local:docker`), or run an X server on Windows. |
+| `Account temporarily locked` | Wait 15 minutes after 5 failed attempts. |
+| "Approval signature is invalid" on restore | The known bug above. |
+| `ModuleNotFoundError: tkinter` | Install `python3-tk`. |
+
+---
+
+## Disclaimer
+
+DATAFORT is a learning/prototype project. It has not been independently audited, and the limitations listed above should be addressed before it is used to protect real production data.
+
+## Author
+
+[sunayan88](https://github.com/sunayan88)
