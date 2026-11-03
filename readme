@@ -1,33 +1,10 @@
-# DATAFORT
+DATAFORT
+Enterprise-grade encrypted backup and controlled-recovery tool for sensitive organizational data.
 
-**Enterprise-grade encrypted backup and controlled-recovery tool for sensitive organizational data.**
+DATAFORT is a Python desktop application (Tkinter GUI, MySQL backend) that lets an organization back up files in encrypted form and restore them only after 
+a manager or admin approves the request. Identity is handled with a small built-in PKI: every user holds an RSA key pair and a certificate issued by the application's own Root CA.
 
-DATAFORT is a Python desktop application (Tkinter GUI, MySQL backend) that lets an organization back up files in encrypted form and restore them only after a manager or admin approves the request. Identity is handled with a small built-in PKI: every user holds an RSA key pair and a certificate issued by the application's own Root CA.
-
----
-
-## Table of Contents
-
-1. [Features](#features)
-2. [Architecture Overview](#architecture-overview)
-3. [Project Structure](#project-structure)
-4. [Roles and Permissions](#roles-and-permissions)
-5. [Security Design](#security-design)
-6. [Database Schema](#database-schema)
-7. [Requirements](#requirements)
-8. [Installation: Docker (recommended)](#installation-docker-recommended)
-9. [Installation: Local (without Docker)](#installation-local-without-docker)
-10. [First-Time Setup](#first-time-setup)
-11. [Usage Guide](#usage-guide)
-12. [Configuration](#configuration)
-13. [Known Issues and Limitations](#known-issues-and-limitations)
-14. [Roadmap / Suggested Improvements](#roadmap--suggested-improvements)
-15. [Troubleshooting](#troubleshooting)
-16. [Disclaimer](#disclaimer)
-
----
-
-## Features
+Key Features 
 
 - **Certificate-based authentication.** Login is a challenge-response: the app unlocks the user's local private key with a passphrase, signs a random 32-byte challenge, and verifies it against the public key stored in the database.
 - **Built-in Certificate Authority.** Self-signed Root CA (10-year validity). User certificates are valid for 1 year and are issued by an admin after reviewing a registration request (CSR).
@@ -41,30 +18,8 @@ DATAFORT is a Python desktop application (Tkinter GUI, MySQL backend) that lets 
 - **Internal messaging.** Users can message the admin, and admins can message anyone.
 - **Docker support.** `docker-compose` brings up MySQL 8 and the application together.
 
----
+Project Structure
 
-## Architecture Overview
-
-```
-+---------------------+        +-----------------------+        +-----------------+
-|  Tkinter GUI        |  --->  |  crypto/ (RSA, AES,   |        |  MySQL 8        |
-|  gui/*.py           |        |  CA, key management)  |        |  datafort_db    |
-|                     |  --->  |  database/db_queries  |  --->  |                 |
-+---------------------+        +-----------------------+        +-----------------+
-          |
-          v
-   ~/.datafort/   (local key material: user keys, CA key/cert, system keys)
-```
-
-- The GUI talks directly to the crypto helpers and the query layer.
-- Encrypted backups, certificates, requests, messages and audit entries are stored in MySQL.
-- Private keys never go to the database; they live in `~/.datafort/` on the machine running the app.
-
----
-
-## Project Structure
-
-```
 Datafort/
 ├── main.py                      # Entry point, starts the login window
 ├── requirements.txt             # Python dependencies
@@ -99,9 +54,6 @@ Datafort/
 │   └── generate_system_keys.py  # One-time: create system key pair
 └── utils/
     └── helpers.py               # (empty placeholder)
-```
-
----
 
 ## Roles and Permissions
 
@@ -116,81 +68,7 @@ Datafort/
 | Deactivate users, revoke certs     | No       | No      | No      | Yes   |
 | Send messages                      | Yes      | Yes     | Yes     | Yes   |
 
-\* Admins are routed to the Admin Panel, which contains certificate requests, restore approvals, user management and messages.
-
-Users may request the role of employee, manager or auditor at registration; the admin decides. The admin account is created only through `scripts/init_ca_and_admin.py`.
-
----
-
-## Security Design
-
-### Cryptographic primitives
-
-| Purpose                      | Algorithm                                              |
-|------------------------------|--------------------------------------------------------|
-| User and system key pairs    | RSA-2048                                               |
-| User private key at rest     | PKCS#8, encrypted with a passphrase (`BestAvailableEncryption`) |
-| Backup data encryption       | AES-256-GCM (random 256-bit key, 96-bit nonce per file) |
-| Backup key wrapping          | RSA-OAEP, MGF1-SHA256, SHA-256                         |
-| Signatures                   | RSA-PSS, MGF1-SHA256, SHA-256                          |
-| Certificates                 | X.509, SHA-256 signature, 1-year user validity         |
-
-### Backup flow
-
-1. User selects files and gives a reason.
-2. Files are packed into a temporary tar archive.
-3. A random AES-256 key and nonce encrypt the archive (GCM produces an authentication tag).
-4. The AES key is encrypted with the system public key.
-5. The user enters their passphrase and signs a manifest hash.
-6. Ciphertext, wrapped key, nonce, tag and signature are stored in the `backups` table; the action is written to the audit log.
-
-### Restore flow
-
-1. The user requests a restore for one of their backups (status: pending).
-2. A manager or admin enters their passphrase to sign an approval.
-3. After approval, the user chooses "Download Restored File".
-4. The app verifies the approver's signature, decrypts the AES key with the system private key, decrypts and authenticates the data (GCM tag), then extracts the tar archive to a chosen folder.
-
-### Audit log
-
-Each entry is signed over `user_id|action|details|timestamp` with the system private key. Auditors can verify any selected entry from the GUI. Logged actions include LOGIN, BACKUP, RESTORE_REQUEST, APPROVE_RESTORE, REJECT_RESTORE, SIGN_DOCUMENT, RESTORE_DOWNLOAD and MESSAGE_SENT.
-
-### Where secrets live
-
-| File (in `~/.datafort/`)    | Contents                         | Protected by passphrase? |
-|-----------------------------|----------------------------------|:------------------------:|
-| `<username>_private.pem`    | User private key                 | Yes                      |
-| `<username>_cert.pem`       | Admin certificate (written by setup script) | n/a           |
-| `ca_private.pem`            | Root CA private key              | **No**                   |
-| `ca_cert.pem`               | Root CA certificate              | n/a                      |
-| `system_private.pem`        | Backup-wrapping private key      | **No**                   |
-| `system_public.pem`         | Backup-wrapping public key       | n/a                      |
-
-> Back these files up securely. **If `system_private.pem` is lost, every existing backup becomes permanently unrecoverable.** If a user's private key is lost, they cannot log in or sign anything.
-
----
-
-## Database Schema
-
-Database name: `datafort_db`. Tables (see `final_schema.sql`):
-
-| Table                  | Purpose                                                        |
-|------------------------|----------------------------------------------------------------|
-| `users`                | Approved users, role, public key, certificate, lockout state   |
-| `certificate_requests` | Pending / approved / rejected registrations (username, CSR)    |
-| `backups`              | Encrypted data, wrapped key, IV, tag, signature, status        |
-| `restore_requests`     | Restore workflow with approver and approval signature          |
-| `audit_log`            | Signed action history                                          |
-| `revoked_certificates` | Revoked certificate serial numbers                             |
-| `messages`             | User-to-user and user-to-admin messages                        |
-
-Roles are an ENUM: `employee`, `manager`, `admin`, `auditor`.
-
-> Use `final_schema.sql` (identical to `mysql-init/init.sql`). The root `schema.sql` is outdated and lacks `failed_login_attempts` and `locked_until`.
-
----
-
-## Requirements
+Requirements
 
 - Python 3.10 or newer
 - MySQL 8.0
@@ -203,9 +81,7 @@ Roles are an ENUM: `employee`, `manager`, `admin`, `auditor`.
 
 For Docker: Docker and Docker Compose.
 
----
-
-## Installation: Docker (recommended)
+Installation: Docker (recommended)
 
 These steps follow `Docker_Tool_installation.md` (written for Kali Linux).
 
@@ -339,67 +215,9 @@ Tunable constants:
 
 > Change the default database passwords in `docker-compose.yml` before any real use.
 
----
+Disclaimer:
+DATAFORT is a learning/prototype project and there are limitations so be careful before it is used to protect real production data.
 
-## Known Issues and Limitations
-
-**Bug (blocks core function):**
-- **Restore download always fails.** Approvers sign `approve:<id>:<timestamp>`, but the restore step verifies `approve:<id>`. Signature verification therefore always returns false and approved restores cannot be downloaded. Fix: sign exactly `approve:<id>`, or store the timestamp and verify against it.
-
-**Security limitations:**
-- CA key and system key are stored **unencrypted** on disk.
-- The system private key is used by the client, so anyone with access to that machine's `~/.datafort/` can decrypt all backups.
-- A manager can approve their own restore request (no requester/approver separation check).
-- The backup signature is stored but not verified at restore time.
-- CSR signatures are not validated when the CA issues a certificate, and the role is not embedded in the certificate.
-- Lockout protects only the GUI; the encrypted key file can still be attacked offline.
-- Audit entries are individually signed but not hash-chained, so deletion of entries is not detectable.
-- `tarfile.extractall` is used without an extraction filter.
-- Docker defaults use hardcoded passwords and publish MySQL on port 3306.
-
-**Functional limitations:**
-- Backups are stored as `LONGBLOB` in MySQL and loaded fully into memory; large files may exceed MySQL's `max_allowed_packet`.
-- No incremental or scheduled backups, no retention policy, no backup deletion.
-- Admins cannot create backups or sign documents (they only see the Admin Panel).
-- The Admin Panel does not write audit entries for certificate approval or restore approval.
-- `pyotp` is listed as a dependency but 2FA is not implemented.
-- `tests.py` is a manual script, not an automated test suite.
-
----
-
-## Roadmap / Suggested Improvements
-
-1. Fix the approval-signature mismatch (see above).
-2. Enforce separation of duties (approver must differ from requester).
-3. Encrypt CA and system private keys; consider an HSM or external KMS.
-4. Verify the backup signature and certificate chain/expiry at login and restore.
-5. Chain audit log entries (include the previous entry's hash).
-6. Split `main_window.py` into the planned tab modules and add a service layer between the GUI and SQL.
-7. Add automated tests (crypto round-trips, DB layer, workflows).
-8. Stream large backups to disk or object storage instead of MySQL blobs.
-9. Remove `venv/` and `__pycache__` from the repository and add a `.gitignore`.
-10. Implement TOTP two-factor authentication (`pyotp` is already a dependency).
-
----
-
-## Troubleshooting
-
-| Symptom | Likely cause / fix |
-|---|---|
-| `Authentication failed` right after correct login | System keys not generated yet; run `scripts/generate_system_keys.py`. |
-| `Private key file not found` | The key is looked up at `~/.datafort/<username>_private.pem` on the current machine. |
-| `Database connection error` | Check `config/config.ini` and that MySQL is running; in Docker wait for the MySQL healthcheck. |
-| GUI does not appear in Docker | Set `DISPLAY`, allow X access (`xhost +local:docker`), or run an X server on Windows. |
-| `Account temporarily locked` | Wait 15 minutes after 5 failed attempts. |
-| "Approval signature is invalid" on restore | The known bug above. |
-| `ModuleNotFoundError: tkinter` | Install `python3-tk`. |
-
----
-
-## Disclaimer
-
-DATAFORT is a learning/prototype project. It has not been independently audited, and the limitations listed above should be addressed before it is used to protect real production data.
-
-## Author
+Author
 
 [sunayan88](https://github.com/sunayan88)
